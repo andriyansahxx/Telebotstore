@@ -2,8 +2,7 @@ import { listProductsPaged, getProduct } from "../db/product.js";
 import { makeUserProductsHandler, makeUserSaldoHandler, makeUserHistoryHandler, makeUserStockHandler } from "./user.js";
 import { getBalance, deductBalance } from "../db/balance.js";
 import { listOrdersPaged, createOrder, getOrder, setPaymentMessage } from "../db/order.js";
-import { getTenant } from "../db/tenant.js";
-import { numberKeyboard } from "../utils/reply_kb.js";
+import { Markup } from "telegraf";
 import { rupiah } from "../utils/ui.js";
 import { listVariants, getVariantByTenant } from "../db/variant.js";
 import { db } from "../db/index.js";
@@ -21,15 +20,16 @@ export function registerUserMenuHears(bot) {
     ctx.match = [undefined, '1'];
     ctx.session = ctx.session || {};
     ctx.session.pickMode = "PRODUCT";
+    ctx.session.userState = "PICK_PRODUCT";
     return handler(ctx);
   });
 
-  // Numeric input handler: used for selecting product number or variant number
-  // NOTE: if we're waiting for quantity (`WAIT_QTY`), do not consume the message here — pass to next handler.
+  // Numeric input handler: used for selecting product number
+  // NOTE: variant and qty selection now use inline keyboards via callback actions
   bot.hears(/^\d+$/, async (ctx, next) => {
     const state = ctx.session?.userState;
     if (!state) return;
-    if (state === "WAIT_QTY") return next();
+    if (state !== "PICK_PRODUCT") return next();
     const n = Number(String(ctx.message?.text || "").trim());
     if (!Number.isFinite(n)) return;
 
@@ -56,34 +56,15 @@ export function registerUserMenuHears(bot) {
         return;
       }
 
-      // prepare variant map
-      const vmap = vars.map((v, i) => ({ num: i + 1, id: v.id, name: v.name, price: v.price, stock: v.stock }));
-      ctx.session.variantMap = vmap;
-      ctx.session.userState = "PICK_VARIANT";
-      ctx.session.pickMode = "VARIANT";
+      ctx.session.userState = "PICK_VARIANT_INLINE";
 
-      let txt = `🧾 ${product.name}\n\nPilih varian (ketik nomor):\n`;
+      let txt = `🧾 ${product.name}\n\nPilih varian:\n`;
       vars.forEach((v, i) => (txt += `${i + 1}. ${v.name} — ${rupiah(v.price)} (stok: ${v.stock})\n`));
-      txt += `\nKetik nomor varian untuk memilih.`;
 
-      const storeName = (getTenant(tenantId)?.name) || "STORE";
-      await ctx.reply(txt, numberKeyboard(Math.min(vars.length, 11), storeName));
-      return;
-    }
+      const buttons = vars.map((v) => [{ text: `${v.name}`, callback_data: `U_VARIANT:${v.id}` }]);
+      buttons.push([{ text: "⬅️ Menu", callback_data: "BACK_MENU" }]);
 
-    // PICK_VARIANT -> select variant and ask qty
-    if (state === "PICK_VARIANT") {
-      const vmap = ctx.session.variantMap || [];
-      const found = vmap.find((x) => x.num === n);
-      if (!found) {
-        await ctx.reply("Nomor varian tidak valid.");
-        return;
-      }
-      const vid = found.id;
-      ctx.session.userState = "WAIT_QTY";
-      ctx.session.pickMode = "QTY";
-      ctx.session.buyVariantId = vid;
-      await ctx.reply(`✅ Kamu memilih:\n${found.name}\nHarga: ${rupiah(found.price)}\nStok: ${found.stock}\n\nKirim angka qty.\nContoh: 3`, { reply_markup: { force_reply: true } });
+      await ctx.reply(txt, Markup.inlineKeyboard(buttons));
       return;
     }
   });
