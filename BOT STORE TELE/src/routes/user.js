@@ -26,6 +26,27 @@ import { fulfillProductOrder } from "../services/order_fulfill.js";
 const PAGE_SIZE = 10;
 const MAX_QTY = Number(process.env.MAX_QTY || 50);
 
+function makeVariantPrompt(product, variants) {
+  let text = `🧾 ${product.name}\n\nPilih varian:\n`;
+  variants.forEach((v, i) => (text += `${i + 1}. ${v.name} — ${rupiah(v.price)} (stok: ${v.stock})\n`));
+
+  const buttons = variants.map((v) => [{ text: `${v.name}`, callback_data: `U_VARIANT:${v.id}` }]);
+  buttons.push([{ text: "⬅️ Menu", callback_data: "BACK_MENU" }]);
+
+  return { text, keyboard: Markup.inlineKeyboard(buttons) };
+}
+
+function makeQtyKeyboard(maxQty) {
+  const buttons = [];
+  for (let i = 1; i <= maxQty; i++) {
+    const row = Math.floor((i - 1) / 5);
+    buttons[row] = buttons[row] || [];
+    buttons[row].push({ text: `${i}`, callback_data: `U_QTY:${i}` });
+  }
+  buttons.push([{ text: "❌ Batal", callback_data: "CANCEL" }]);
+  return Markup.inlineKeyboard(buttons);
+}
+
 // Exportable factories so hears can reuse the same handlers as actions
 export function makeUserProductsHandler() {
   return async function userProducts(ctx) {
@@ -175,11 +196,10 @@ export function registerUserActions(bot, adminSet) {
       return;
     }
 
-    // Convert variant list into numbered list and ask user to type the number
-    let txt = `🧾 ${product.name}\n\nPilih varian (ketik nomor):\n`;
-    vars.forEach((v, i) => (txt += `${i + 1}. ${v.name} — ${rupiah(v.price)} (stok: ${v.stock})\n`));
-    txt += `\nKetik nomor varian untuk memilih.`;
-    await ctx.reply(txt, { reply_markup: { force_reply: true } });
+    ctx.session.userState = "PICK_VARIANT_INLINE";
+
+    const { text, keyboard } = makeVariantPrompt(product, vars);
+    await editOrReply(ctx, text, keyboard);
   });
 
   bot.action(/U_VARIANT:(\d+)/, async (ctx) => {
@@ -190,13 +210,51 @@ export function registerUserActions(bot, adminSet) {
       return;
     }
 
-    ctx.session.userState = "WAIT_QTY";
+    const maxQty = Math.min(MAX_QTY, Number(v.stock) || 0);
+    if (maxQty <= 0) {
+      await editOrReply(ctx, `⚠️ Stok ${v.name} sedang kosong.`, ctx.state.menu);
+      return;
+    }
+
+    ctx.session.userState = "PICK_QTY_INLINE";
     ctx.session.buyVariantId = vid;
 
     await ctx.reply(
-      `✅ Kamu memilih:\n${v.name}\nHarga: ${rupiah(v.price)}\nStok: ${v.stock}\n\nKirim angka qty.\nContoh: 3`,
-      { reply_markup: { force_reply: true } }
+      `✅ Varian dipilih:\n${v.name}\nHarga: ${rupiah(v.price)}\nStok: ${v.stock}\n\nPilih qty:`,
+      makeQtyKeyboard(maxQty)
     );
+  });
+
+  bot.action(/U_QTY:(\d+)/, async (ctx) => {
+    const qty = Number(ctx.match[1]);
+    const vid = Number(ctx.session?.buyVariantId);
+
+    if (!vid) {
+      await ctx.answerCbQuery("❌ Pilih varian terlebih dahulu.");
+      return;
+    }
+
+    if (!Number.isFinite(qty) || qty <= 0) {
+      await ctx.answerCbQuery("❌ Qty tidak valid.");
+      return;
+    }
+
+    const v = getVariant(vid);
+    if (!v) {
+      await editOrReply(ctx, "Varian tidak ditemukan.", ctx.state.menu);
+      return;
+    }
+
+    const maxQty = Math.min(MAX_QTY, Number(v.stock) || 0);
+    if (qty > maxQty) {
+      await ctx.answerCbQuery("❌ Qty melebihi stok/maks.");
+      return;
+    }
+
+    ctx.session.buyVariantId = null;
+    ctx.session.userState = null;
+
+    await startCheckoutFlow(ctx, vid, qty);
   });
   
   bot.action("CANCEL", async (ctx) => {
@@ -763,6 +821,93 @@ export function registerUserActions(bot, adminSet) {
   bot.action("NOP", async (ctx) => ctx.answerCbQuery());
 }
 
+async function startCheckoutFlow(ctx, variantId, qty) {
+  if (!Number.isFinite(qty) || qty <= 0 || qty > 999) {
+    await ctx.reply("❌ Qty tidak valid. Contoh: 3");
+    return true;
+  }
+
+  if (qty > MAX_QTY) {
+    await ctx.reply(`❌ Maksimal qty ${MAX_QTY}.`);
+    return true;
+  }
+
+  const v = getVariant(variantId);
+  if (!v) {
+    await ctx.reply("Varian tidak ditemukan. /start");
+    return true;
+  }
+
+  if (qty > Number(v.stock)) {
+    await ctx.reply(`❌ Qty melebihi stok. Stok tersedia: ${v.stock}`);
+    return true;
+  }
+
+  const ownerT = getTenantByOwner(ctx.from.id);
+  const tenantForOrder = Number(ctx.state.tenantId) || (ownerT ? ownerT.id : 0);
+
+  if (tenantNeedsPakasir(tenantForOrder)) {
+    await sendPakasirNotSetMessage(ctx, tenantForOrder);
+    ctx.session.userState = null;
+    ctx.session.buyVariantId = null;
+    return true;
+  }
+
+  const cfg = getPakasirConfigByTenantId(tenantForOrder);
+  if (!cfg?.slug || !cfg?.apiKey) {
+    await ctx.reply("Pakasir belum dikonfigurasi.");
+    return true;
+  }
+
+  const total = qty * Number(v.price);
+  const orderId = `O${Date.now().toString(36)}`.toUpperCase();
+  const tenantId = tenantForOrder;
+
+  try {
+    createOrder({
+      tenantId: tenantId,
+      userId: ctx.from.id,
+      kind: "PRODUCT",
+      variantId: variantId,
+      qty: qty,
+      orderId: orderId,
+      amount: total,
+      total: total
+    });
+  } catch (createErr) {
+    console.error("❌ CREATE_ORDER_FAILED:", orderId, "tenant:", tenantId, "error:", createErr.message);
+    await ctx.reply(
+      `⚠️ GAGAL BUAT ORDER\n\n` +
+      `Error: ${createErr.message}\n\n` +
+      `Silakan coba lagi atau hubungi admin.`,
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  ctx.session.userState = "WAIT_PAYMENT_METHOD";
+  ctx.session.checkoutData = {
+    tenantId,
+    variantId: variantId,
+    qty,
+    orderId,
+    amount: total,
+    variantName: v.name
+  };
+
+  const balance = getBalance(tenantId, ctx.from.id);
+  const user = await ctx.db?.prepare(`SELECT bank_id FROM users WHERE id=?`).get(ctx.from.id) || {};
+
+  await ctx.reply(
+    `🧾 KONFIRMASI PEMBAYARAN\n\n👤 Nama: ${ctx.from.first_name}\n🆔 User ID: ${ctx.from.id}\n🏦 Bank ID: ${user.bank_id || "-"}\n\n💰 Saldo: Rp${balance.toLocaleString("id-ID")}\n💵 Total: Rp${total.toLocaleString("id-ID")}\n\nPilih metode pembayaran:`,
+    {
+      reply_markup: Markup.keyboard([["💰 Pakai Saldo BOT"], ["📲 QRIS Pakasir"], ["❌ Batal"]]).resize(),
+    }
+  );
+
+  return true;
+}
+
 function monthsFromPlan(orderId) {
   // orderId: RENT-userid-timestamp, months stored in rents; we’ll read months from rent table in admin step later.
   // For now, activation uses rents.months via activateRent(orderId, months) already passed in, but we re-activate safely:
@@ -792,16 +937,13 @@ export async function handleUserText(ctx) {
     return true;
   }
 
-  if (ctx.session?.userState !== "WAIT_QTY") return false;
+
+  const state = ctx.session?.userState;
+  if (state !== "WAIT_QTY" && state !== "PICK_QTY_INLINE") return false;
 
   const qty = Number(String(ctx.message?.text || "").trim());
-  if (!Number.isFinite(qty) || qty <= 0 || qty > 999) {
+  if (!Number.isFinite(qty)) {
     await ctx.reply("❌ Qty tidak valid. Contoh: 3");
-    return true;
-  }
-
-  if (qty > MAX_QTY) {
-    await ctx.reply(`❌ Maksimal qty ${MAX_QTY}.`);
     return true;
   }
 
@@ -809,89 +951,12 @@ export async function handleUserText(ctx) {
   ctx.session.userState = null;
   ctx.session.buyVariantId = null;
 
-  const v = getVariant(vid);
-  if (!v) {
-    await ctx.reply("Varian tidak ditemukan. /start");
+  if (!vid) {
+    await ctx.reply("❌ Pilih varian terlebih dahulu.");
     return true;
   }
 
-  // Determine tenant that will own the order (order.tenant_id)
-  const ownerT = getTenantByOwner(ctx.from.id);
-  const tenantForOrder = Number(ctx.state.tenantId) || (ownerT ? ownerT.id : 0);
-
-  // GUARD: jika tenant (order.tenant_id) belum set pakasir, blok checkout
-  if (tenantNeedsPakasir(tenantForOrder)) {
-    await sendPakasirNotSetMessage(ctx, tenantForOrder);
-    ctx.session.userState = null;
-    ctx.session.buyVariantId = null;
-    return true;
-  }
-
-  // Resolve pakasir config from the order's tenant id (source of truth)
-  let cfg = getPakasirConfigByTenantId(tenantForOrder);
-  if (!cfg?.slug || !cfg?.apiKey) {
-    await ctx.reply("Pakasir belum dikonfigurasi.");
-    return true;
-  }
-
-  const total = qty * Number(v.price);
-  const orderId = `O${Date.now().toString(36)}`.toUpperCase();
-
-  const tenantId = tenantForOrder;
-
-  // Create order in database SEBELUM kirim tombol pembayaran
-  try {
-    createOrder({
-      tenantId: tenantId,
-      userId: ctx.from.id,
-      kind: "PRODUCT",
-      variantId: vid,
-      qty: qty,
-      orderId: orderId,
-      amount: total,
-      total: total
-    });
-    console.log("✅ CREATE_ORDER_SUCCESS:", orderId, "tenant:", tenantId, "user:", ctx.from.id);
-    
-    // DEBUG: Verify order actually saved
-    const test = getOrder(orderId);
-    console.log("🔍 ORDER_SAVED?", !!test, orderId);
-    if (!test) {
-      console.error("❌ ORDER_INSERT_FAILED: Order created but not found in DB:", orderId);
-    }
-  } catch (createErr) {
-    console.error("❌ CREATE_ORDER_FAILED:", orderId, "tenant:", tenantId, "error:", createErr.message);
-    await ctx.reply(
-      `⚠️ GAGAL BUAT ORDER\n\n` +
-      `Error: ${createErr.message}\n\n` +
-      `Silakan coba lagi atau hubungi admin.`,
-      { parse_mode: "HTML" }
-    );
-    return true;
-  }
-
-  // Store order details in session for payment method selection
-  ctx.session.userState = "WAIT_PAYMENT_METHOD";
-  ctx.session.checkoutData = {
-    tenantId,
-    variantId: vid,
-    qty,
-    orderId,
-    amount: total,
-    variantName: v.name
-  };
-
-  const balance = getBalance(tenantId, ctx.from.id);
-
-  const user = await ctx.db?.prepare(`SELECT bank_id FROM users WHERE id=?`).get(ctx.from.id) || {};
-
-  await ctx.reply(
-    `🧾 KONFIRMASI PEMBAYARAN\n\n👤 Nama: ${ctx.from.first_name}\n🆔 User ID: ${ctx.from.id}\n🏦 Bank ID: ${user.bank_id || "-"}\n\n💰 Saldo: Rp${balance.toLocaleString("id-ID")}\n💵 Total: Rp${total.toLocaleString("id-ID")}\n\nPilih metode pembayaran:`,
-    {
-      reply_markup: Markup.keyboard([["💰 Pakai Saldo BOT"], ["📲 QRIS Pakasir"], ["❌ Batal"]]).resize(),
-    }
-  );
-
+  await startCheckoutFlow(ctx, vid, qty);
   return true;
 }
 
